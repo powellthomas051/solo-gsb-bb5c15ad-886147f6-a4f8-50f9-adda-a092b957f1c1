@@ -10,7 +10,12 @@ The normaliser turns messy real-world address text into a comparable form:
 * house numbers are extracted with their own normalisation rules
   (``#12-B`` / ``No. 12b`` / ``12号`` -> ``12b``) and handled separately
   from the word tokens; ranges and slash numbers stay whole
-  (``12-14`` / ``12–14`` / ``12/14``);
+  (``12-14`` / ``12–14`` / ``12/14``). Numbers introduced by a unit word
+  (``Apt 5`` / ``Unit 7B`` / ``Suite 200``) are unit references, never the
+  house number: the scan keeps looking across commas/spaces for the real
+  house number (``Apt 5, 123 Main St`` -> ``123``), and the street segment
+  it was lifted from still counts as street (``main st`` stays on the
+  street line);
 
 Tokens are additionally split into two components so scoring can treat them
 differently:
@@ -85,8 +90,25 @@ _HOUSE_PREFIX = re.compile(
     r"(?:#+\s*|no\.?\s*|nr\.?\s*|nummer\s*|n[oº]\.?\s*)",
     re.IGNORECASE,
 )
+# Words that mark a number as a unit/building reference instead of the house
+# number (``Apt 5``, ``Unit 7B``, ``3楼`` ...).
+_BUILDING_WORD_SOURCE = (
+    r"apt|ste|suite|unit|fl(?:oor)?|rm|room|bldg|building"
+    r"|栋|幢|号楼|单元|室|樓|楼"
+)
 _BUILDING_WORDS = re.compile(
-    r"(?:apt|ste|suite|unit|fl(?:oor)?|rm|room|bldg|building|栋|幢|号楼|单元|室|樓|楼)",
+    r"(?:" + _BUILDING_WORD_SOURCE + r")",
+    re.IGNORECASE,
+)
+# The same words *in front of* a number (spaces or a comma in between) make
+# the number a unit reference, never the house number: in ``Apt 5, 123 Main
+# St`` the ``5`` belongs to the unit and the real house number follows later.
+# ASCII unit words need a word boundary (``Farm 5`` is not ``Rm 5``); CJK
+# unit characters attach directly (``3楼``).
+_UNIT_PREFIX = re.compile(
+    r"(?:^|[^a-z0-9])(?:apt|ste|suite|unit|fl(?:oor)?|rm|room|bldg|building)"
+    r"[\s,，;；]*$"
+    r"|(?:栋|幢|号楼|单元|室|樓|楼)[\s,，;；]*$",
     re.IGNORECASE,
 )
 _TRAILING_CJK_NO = re.compile(r"([0-9]+[a-z]?)\s*(?:号|號)")
@@ -94,6 +116,15 @@ _TRAILING_CJK_NO = re.compile(r"([0-9]+[a-z]?)\s*(?:号|號)")
 # numbers ``12/14`` are extracted as one house number.
 _NUMBER = re.compile(r"\d+[a-z]?(?:[-–/](?:\d+[a-z]?|[a-z]))*")
 _POSTCODE = re.compile(r"^\d{5,6}(?:-\d{4})?$")
+
+# Canonical road-suffix tokens (after ``_clean`` folds the abbreviations)
+# plus common suffix words the abbreviation map leaves untouched.
+_STREET_SUFFIX_TOKENS = {
+    "st", "rd", "ave", "blvd", "dr", "ln", "ct", "ter", "pl", "sq",
+    "way", "row", "circle", "parkway", "highway", "alley", "trail",
+    "loop", "crossing", "walk",
+}
+_HOUSE_LIKE_TOKEN = re.compile(r"\d+[a-z]?")
 
 # ------------------------------------------------------------------ result --
 
@@ -165,6 +196,11 @@ def extract_house(text: str) -> tuple[str | None, str]:
         tail = text[end:end + 12].lstrip()
         if _BUILDING_WORDS.match(tail):
             continue
+        # ``Apt 5`` / ``Unit 7B`` / ``Suite 200``: a unit word directly in
+        # front of the number (across spaces or a comma) makes it a unit
+        # reference; keep scanning for the real house number behind it.
+        if _UNIT_PREFIX.search(text[:nm.start()]):
+            continue
         rest = text[end:]
         if re.fullmatch(r"\d{5}", nm.group(0)) and re.fullmatch(
             r"[^0-9a-z" + _CJK + r"]*", rest, re.IGNORECASE
@@ -213,6 +249,24 @@ def _clean(text: str) -> str:
     return _WS_RE.sub(" ", text).strip()
 
 
+def _looks_like_street_segment(words: list[str]) -> bool:
+    """Whether a comma-separated segment belongs to the street line.
+
+    The house number may already have been extracted from this very segment
+    (``Apt 5, 123 Main St`` leaves ``main st`` behind), so a trailing road
+    suffix -- or a remaining house-number-like token (postcodes aside) --
+    marks the segment as street even when it has no leading number.
+    """
+    if not words:
+        return False
+    if words[-1] in _STREET_SUFFIX_TOKENS:
+        return True
+    return any(
+        _HOUSE_LIKE_TOKEN.fullmatch(w) and not _POSTCODE.fullmatch(w)
+        for w in words
+    )
+
+
 def normalize(value: str) -> Normalized:
     """Normalise a free-text address."""
     if value is None:
@@ -254,6 +308,11 @@ def normalize(value: str) -> Normalized:
             for w in words
         ):
             locality_parts.extend(non_country_words)
+        elif _looks_like_street_segment(words):
+            # "main st" / "oak ave": a road suffix or leftover house number
+            # keeps the segment on the street line even without a leading
+            # number (the house number may have been extracted from it).
+            street_parts.append(seg)
         elif len(non_country_words) <= 3 and not _BUILDING_WORDS.search(seg):
             # "New York", "Los Angeles", "Springfield" -> locality
             locality_parts.extend(non_country_words)

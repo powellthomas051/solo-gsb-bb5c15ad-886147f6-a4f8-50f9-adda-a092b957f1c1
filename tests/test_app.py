@@ -50,6 +50,30 @@ def test_house_number_formats():
     assert normalize("99 SW 26th Ave Unit 7B, Portland").house == "99"
 
 
+def test_unit_prefix_house_number():
+    # A leading Apt/Unit/Suite number is a unit reference, never the house
+    # number; the real house number is found across the comma/space.
+    n = normalize("Apt 5, 123 Main St, New York")
+    assert n.house == "123"
+    # the unit stays on the street line and never leaks into locality
+    assert n.street_tokens == ["apt", "5", "main", "st"]
+    assert n.locality_tokens == ["new", "york"]
+    # the street segment keeps its tokens even after the house number was
+    # lifted out of it (it must not be demoted to locality)
+    assert "main" in n.street_tokens and "st" in n.street_tokens
+    assert "123" not in n.locality_tokens and "5" not in n.locality_tokens
+
+    assert normalize("Unit 7B, 99 SW 26th Ave, Portland OR").house == "99"
+    n = normalize("Suite 200, 456 Oak Avenue, Brooklyn, NY 11201")
+    assert n.house == "456"
+    assert "oak" in n.street_tokens and "ave" in n.street_tokens
+    assert n.locality_tokens == ["brooklyn", "ny", "11201"]
+    # street-first spelling keeps working unchanged
+    n = normalize("123 Main St Apt 5")
+    assert n.house == "123"
+    assert n.street_tokens == ["main", "st", "apt", "5"]
+
+
 def test_compound_house_number_formats():
     # ranges and slash numbers stay whole (and the en dash canonicalises)
     assert normalize("12-14 Main St").house == "12-14"
@@ -191,6 +215,51 @@ def test_match_with_unit_suffix(client):
     data = r.json()
     assert data["normalized"]["house"] == "99"
     assert data["best_id"] == 14
+    assert data["status"] == "auto_matched"
+
+
+def test_match_with_unit_prefix(client):
+    # Unit-first spelling of STD-001: the unit number must not become the
+    # house number and "123 Main St" must not be demoted to locality.
+    r = client.post("/api/match",
+                    json={"query": "Apt 5, 123 Main St, New York"})
+    data = r.json()
+    assert data["normalized"]["house"] == "123"
+    assert data["best_id"] == 1
+    best = data["candidates"][0]
+    assert best["address"]["house"] == "123"
+    assert best["house_score"] == 1.0
+    # match details show the real street tokens, not a misplaced locality
+    matched = {m["query"] for m in best["street_tokens"]["matched"]}
+    assert {"main", "st"} <= matched
+    assert data["status"] in {"auto_matched", "needs_review"}
+
+
+def test_import_and_match_unit_prefix_shared(client):
+    # The CSV/JSON importer shares the query-side parser: a unit-first
+    # standard address is stored with the real house number, and the
+    # street-first spelling of the same address auto-matches it.
+    r = client.post("/api/addresses", json={
+        "addresses": [{
+            "address": "Apt 5, 123 Main St",
+            "city": "New York", "state": "NY",
+            "postal_code": "10001", "country": "USA",
+            "external_id": "TEST-UNIT-PREFIX",
+        }],
+        "skip_duplicates": True,
+    })
+    assert r.status_code == 200
+    assert r.json()["inserted"] == 1
+
+    rows = client.get("/api/addresses", params={"limit": 500}).json()["items"]
+    stored = next(a for a in rows if a["external_id"] == "TEST-UNIT-PREFIX")
+    assert stored["house"] == "123"
+
+    r = client.post("/api/match",
+                    json={"query": "123 Main St Apt 5, New York"})
+    data = r.json()
+    assert data["normalized"]["house"] == "123"
+    assert data["best_id"] == stored["id"]
     assert data["status"] == "auto_matched"
 
 
