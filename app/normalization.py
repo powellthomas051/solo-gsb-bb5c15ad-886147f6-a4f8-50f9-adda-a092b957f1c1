@@ -11,6 +11,11 @@ The normaliser turns messy real-world address text into a comparable form:
   (``#12-B`` / ``No. 12b`` / ``12号`` -> ``12b``) and handled separately
   from the word tokens; ranges and slash numbers stay whole
   (``12-14`` / ``12–14`` / ``12/14``);
+* unit/sub-premise references (``Apt 5``, ``Unit 7B``, ``3楼`` ...) are
+  removed before house extraction wherever they sit -- leading, trailing,
+  across a comma or separated by spaces only -- so the unit number can
+  never act as the house number or as a street/locality token. In
+  ``Apt 5, 123 Main St`` the house number is therefore ``123``;
 
 Tokens are additionally split into two components so scoring can treat them
 differently:
@@ -89,6 +94,25 @@ _BUILDING_WORDS = re.compile(
     r"(?:apt|ste|suite|unit|fl(?:oor)?|rm|room|bldg|building|栋|幢|号楼|单元|室|樓|楼)",
     re.IGNORECASE,
 )
+# A unit/sub-premise reference: "Apt 5", "Unit 7B", "Suite 300", "3楼",
+# "2栋", "Apt #5". Such numbers identify a unit, never the house number --
+# even when the reference is written *before* the street line
+# ("Apt 5, 123 Main St") -- so the whole reference is stripped before house
+# extraction. This runs before abbreviation normalisation, so both the long
+# ("suite", "apartment") and canonical ("ste") forms are listed; bare "fl"
+# is deliberately excluded because it is the Florida state abbreviation.
+# CJK markers may sit on either side of the number.
+_UNIT_NUMBER = r"\d+[a-z0-9-]*"
+_UNIT_REFERENCE = re.compile(
+    r"(?<![a-z0-9])(?:apt|ste|unit|rm|bldg)"
+    r"[.\s]+#?\s*" + _UNIT_NUMBER + r"\b"
+    r"|(?<![a-z0-9])fl\.[.\s]*#?\s*" + _UNIT_NUMBER + r"\b"
+    r"|(?<![a-z0-9])(?:floor|room|building|suite|apartment)"
+    r"[.\s]+#?\s*" + _UNIT_NUMBER + r"\b"
+    r"|(?<![a-z0-9])" + _UNIT_NUMBER + r"\s*(?:单元|号楼|栋|幢|室|楼|樓)"
+    r"|(?:单元|号楼|栋|幢|室|楼|樓)\s*#?\s*" + _UNIT_NUMBER + r"(?![0-9a-z])",
+    re.IGNORECASE,
+)
 _TRAILING_CJK_NO = re.compile(r"([0-9]+[a-z]?)\s*(?:号|號)")
 # Compound numbers stay whole: ranges ``12-14`` / ``12–14`` and slash
 # numbers ``12/14`` are extracted as one house number.
@@ -143,7 +167,15 @@ def _canonical_house(raw: str) -> str:
 
 
 def extract_house(text: str) -> tuple[str | None, str]:
-    """Return ``(house_number, text_without_house)``."""
+    """Return ``(house_number, text_without_house)``.
+
+    Unit/sub-premise references (``Apt 5``, ``Unit 7B``, ``3楼`` ...) are
+    removed first, wherever they appear -- leading ("Apt 5, 123 Main St"),
+    trailing ("123 Main St Apt 5") or mid-line -- so a unit number can
+    neither be mistaken for the house number nor leak into the locality.
+    """
+    text = _UNIT_REFERENCE.sub(" ", text)
+
     # 1a. prefix markers: #12, No. 12
     m = _HOUSE_PREFIX.search(text)
     if m:
@@ -218,32 +250,44 @@ def normalize(value: str) -> Normalized:
     if value is None:
         value = ""
     text = _unify_unicode(value).lower()
-    house, text = extract_house(text)
 
     # Preserve comma-separated segments so street vs locality can be split.
+    # Splitting *before* house extraction matters for leading unit references
+    # ("Apt 5, 123 Main St"): the unit-only first segment must not claim the
+    # role (or the number) of the real street line that follows it.
     raw_segments = [seg.strip() for seg in re.split(r"[,，;；]", text) if seg.strip()]
     if not raw_segments:
         raw_segments = [text]
 
-    cleaned_segments = [_clean(seg) for seg in raw_segments]
-    cleaned_segments = [seg for seg in cleaned_segments if seg]
+    house: str | None = None
+    cleaned_segments: list[tuple[str, str]] = []  # (original, cleaned)
+    for raw_seg in raw_segments:
+        seg_house, seg_rest = extract_house(raw_seg)
+        cleaned = _clean(seg_rest)
+        if house is None and seg_house is not None:
+            house = seg_house
+        if cleaned:
+            cleaned_segments.append((raw_seg, cleaned))
 
-    # Decide each segment's role. The first segment is always the street line;
-    # CJK addresses usually keep everything in one line and are handled by the
-    # tokenizer there. Later segments are locality unless they look street-ish.
+    # Decide each segment's role from its *original* text -- classification
+    # markers (CJK road characters, unit words) are stripped out of the
+    # cleaned form but still indicate that the segment is a street line.
     street_parts: list[str] = []
     locality_parts: list[str] = []
-    for idx, seg in enumerate(cleaned_segments):
+    for idx, (raw_seg, seg) in enumerate(cleaned_segments):
         words = seg.split()
         if idx == 0:
+            # The first surviving segment is the street line: leading
+            # unit-only segments ("Apt 5,") disappear during stripping, so
+            # the street line is the segment that actually remains.
             street_parts.append(seg)
             continue
-        is_cjk = bool(re.search(rf"[{_CJK}]", seg))
+        is_cjk = bool(re.search(rf"[{_CJK}]", raw_seg))
         non_country_words = [w for w in words if w not in _COUNTRY_WORDS]
         if is_cjk:
             # Chinese city names: short CJK segment (上海, 北京市) -> locality,
             # but a segment containing a road character belongs to street.
-            if any(ch in seg for ch in "路街道巷弄"):
+            if any(ch in raw_seg for ch in "路街道巷弄"):
                 street_parts.append(seg)
             else:
                 locality_parts.extend(non_country_words)
@@ -254,7 +298,7 @@ def normalize(value: str) -> Normalized:
             for w in words
         ):
             locality_parts.extend(non_country_words)
-        elif len(non_country_words) <= 3 and not _BUILDING_WORDS.search(seg):
+        elif len(non_country_words) <= 3 and not _BUILDING_WORDS.search(raw_seg):
             # "New York", "Los Angeles", "Springfield" -> locality
             locality_parts.extend(non_country_words)
         else:

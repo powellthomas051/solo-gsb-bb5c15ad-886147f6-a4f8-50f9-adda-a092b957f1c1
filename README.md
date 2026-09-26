@@ -101,6 +101,12 @@ curl -s -X POST http://localhost:8000/api/match \
 curl -s -X POST http://localhost:8000/api/match \
   -H 'Content-Type: application/json' \
   -d '{"query": "1 Milky Way, Mars Base"}'
+
+# 7) 自动命中（前置单元号）：Apt 5 不会被当成门牌号，真正的 123 跨逗号定位
+curl -s -X POST http://localhost:8000/api/match \
+  -H 'Content-Type: application/json' \
+  -d '{"query": "Apt 5, 123 Main St, New York, NY 10001"}'
+# 与街道在前写法等价：123 Main St Apt 5, New York, NY 10001
 ```
 
 批量匹配：
@@ -482,8 +488,14 @@ CSV 支持的列名（均可识别别名，表头大小写不敏感）：
    - 道路缩写归一：`street/str/st.`→`st`、`road/rd.`→`rd`、`avenue/av`→`ave` 等，
      方向词 `north/south/east/west`→`n/s/e/w`；
    - 门牌号单独抽取并规范化：`#12-B`、`No. 12b`、`12号`、`１２Ｂ` → `12b`
-     （5 位孤立数字识别为邮编，`Apt/Suite/Unit/栋/室` 后的数字不会误当门牌号）；
-     区间号与斜杠复合号完整保留（`12-14`、`12–14` → `12-14`，`12/14`）。
+     （5 位孤立数字识别为邮编）；区间号与斜杠复合号完整保留
+     （`12-14`、`12–14` → `12-14`，`12/14`）；
+   - **单元/套间引用先整体剔除再抽门牌**：`Apt/Unit/Suite/Ste/Rm/Room/Bldg`
+     （及中文 `栋/幢/单元/室/楼/号楼`）所带的数字一律视为单元号，无论写在街道
+     前后、跨逗号还是仅以空格分隔。`Apt 5, 123 Main St` 中门牌号是 **123**
+     （`5` 与 `apt` 不进入门牌、道路或地区词元），与 `123 Main St Apt 5`
+     完全等价；逗号分段后首个**非空**片段才是街道行，片段的街道/地区归属
+     按剔除前原文判定。查询与 CSV 标准地址导入共用同一解析。
 
 2. **词元化与词元相似度**（`app/matcher.py`）
    - 地址先按逗号/结构化字段拆成 **道路行**（street）与 **地区**（city/state/postcode）两个部分；

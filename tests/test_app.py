@@ -60,6 +60,70 @@ def test_compound_house_number_formats():
     assert "14" not in n.street_tokens
 
 
+@pytest.mark.parametrize("text", [
+    "Apt 5, 123 Main St, New York",
+    "Unit 5, 123 Main St, New York",
+    "Suite 5, 123 Main St, New York",
+    "Ste 5, 123 Main St, New York",
+    "Apt #5, 123 Main St, New York",
+    "APT 5, 123 MAIN STREET, NEW YORK",
+])
+def test_leading_unit_number_not_house_or_locality(text):
+    # The leading unit number must not be taken for the house number; the
+    # real house number is located across the comma, and the unit tokens
+    # ("apt"/"5") must not survive as street or locality tokens.
+    n = normalize(text)
+    assert n.house == "123"
+    assert n.street_tokens == ["main", "st"]
+    assert "5" not in n.tokens
+    assert "apt" not in n.tokens and "unit" not in n.tokens and "ste" not in n.tokens
+    assert n.locality_tokens == ["new", "york"]
+
+
+def test_mid_and_trailing_unit_references_stripped():
+    n = normalize("123 Main St Apt 5")
+    assert n.house == "123"
+    assert n.street_tokens == ["main", "st"]
+    assert "5" not in n.tokens and "apt" not in n.tokens
+
+    n = normalize("123 Main St, Apt 5, New York, NY 10001")
+    assert n.house == "123"
+    assert n.street_tokens == ["main", "st"]
+    assert n.locality_tokens == ["new", "york", "ny", "10001"]
+
+    # space-separated (no comma) leading unit still finds the real house
+    n = normalize("Suite 300 100 Market St San Francisco")
+    assert n.house == "100"
+    assert n.street_tokens[:2] == ["market", "st"]
+    assert "300" not in n.tokens
+
+    # other building markers behave the same
+    n = normalize("Room 4, 50 Elm St, Chicago")
+    assert n.house == "50"
+    assert n.street_tokens == ["elm", "st"]
+    assert n.locality_tokens == ["chicago"]
+
+
+def test_unit_only_address_has_no_house():
+    # A unit reference with no street/house yields neither a house number
+    # nor stray tokens.
+    n = normalize("Apt 5")
+    assert n.house is None
+    assert n.tokens == []
+
+
+def test_state_abbreviation_fl_not_treated_as_floor_unit():
+    # Bare "fl" is the Florida state code; only dotted "fl." means floor.
+    n = normalize("100 Main St, Miami, FL, 33101")
+    assert n.house == "100"
+    assert "33101" in n.locality_tokens
+    assert "fl" in n.locality_tokens
+
+    n = normalize("Fl. 3, 100 Main St, Miami")
+    assert n.house == "100"
+    assert "3" not in n.tokens
+
+
 def test_cjk_traditional_to_simplified_and_fullwidth():
     n = normalize("北京東路８８號 3楼")
     assert n.house == "88"
@@ -194,6 +258,31 @@ def test_match_with_unit_suffix(client):
     assert data["status"] == "auto_matched"
 
 
+def test_match_with_leading_unit_prefix(client):
+    # A unit reference written *before* the street line must match the same
+    # standard address as the street-first spelling.
+    r = client.post("/api/match",
+                    json={"query": "Apt 5, 123 Main St, New York, NY 10001"})
+    data = r.json()
+    assert data["normalized"]["house"] == "123"
+    assert data["best_id"] == 1
+    assert data["status"] == "auto_matched"
+    best = data["candidates"][0]
+    matched_street = {m["candidate"] for m in best["street_tokens"]["matched"]}
+    assert {"main", "st"} <= matched_street
+    # the unit number is neither a street nor a locality token
+    assert "5" not in {t for m in best["matched_tokens"] for t in m.values()}
+    assert "5" not in best["street_tokens"]["query_only"]
+    assert "5" not in best["locality_tokens"]["query_only"]
+
+    # identical to the street-first spelling
+    r2 = client.post("/api/match",
+                     json={"query": "123 Main St Apt 5, New York, NY 10001"})
+    data2 = r2.json()
+    assert data2["best_id"] == 1
+    assert data2["status"] == "auto_matched"
+
+
 def test_match_terrace_abbreviation(client):
     r = client.post("/api/match", json={"query": "742 Evergreen Tce"})
     data = r.json()
@@ -308,6 +397,37 @@ def test_csv_upload_and_dedup(client):
 
     r = client.post("/api/match", json={"query": "9 Test Ln, Testville 99999"})
     assert r.json()["best_id"] is not None
+
+
+def test_csv_import_leading_unit_and_query_share_parsing(client):
+    # The CSV standard-address importer and the live query must apply the
+    # same unit-aware parsing: a leading unit number is not the house
+    # number, and the street line is recovered across the comma.
+    csv_bytes = (
+        b"external_id,address,city,state,postal_code\n"
+        b'U1,"Apt 5, 777 Northgate Way",Seattle,WA,98101\n'
+    )
+    r = client.post("/api/addresses/upload",
+                    files={"file": ("u.csv", csv_bytes, "text/csv")})
+    assert r.status_code == 200
+    assert r.json()["inserted"] == 1
+
+    # query in either word order must auto-match the imported record
+    for query in (
+        "Apt 5, 777 Northgate Way, Seattle WA 98101",
+        "777 Northgate Way Apt 5, Seattle WA 98101",
+    ):
+        data = client.post("/api/match", json={"query": query}).json()
+        assert data["normalized"]["house"] == "777"
+        assert data["status"] == "auto_matched", query
+        assert data["candidates"][0]["address"]["external_id"] == "U1"
+
+    # a different house number on the same street must not be accepted
+    wrong = client.post(
+        "/api/match",
+        json={"query": "Apt 5, 778 Northgate Way, Seattle WA 98101"},
+    ).json()
+    assert wrong["status"] != "auto_matched"
 
 
 # ----------------------------------------------------- CSV preview / confirm
